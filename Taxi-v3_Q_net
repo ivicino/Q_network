@@ -1,0 +1,43 @@
+import gym
+import numpy as np
+
+# 1: load environment and Q-learning structure
+env = gym.make('Taxi-v3')
+Q = np.zeros([env.observation_space.n, env.action_space.n])
+print(env.P)
+# 2: Parameters of Q learning algorithm
+LR = 0.5
+GAMMA = .9999
+EPISODES = 200   # 200 (First time it successfully picked up a passanger)-> EPISODES = 500 (consistant pick up and drop off) with LR 0.5
+REWARD_LIST = []
+
+#Q learning algorithm
+for i in range(EPISODES):
+    # Reset environment
+    STATE = env.reset()
+    REWARDS = 0  # all rewards
+    DONE = False  # done
+    j = 0 
+
+    #Q table update
+    while j < 99:
+        env.render()
+        j+=1
+        # Choose action from Q table
+        ACTION = np.argmax(Q[STATE,:] + np.random.randn(1,env.action_space.n)*(1./(i+1))) 
+        # ^It gradually stops introducing random numbers to the algorithm as the episodes progress
+
+        #Get new state & reward from environment
+        new_STATE,r,DONE,_ = env.step(ACTION)
+        #Update Q-Table with new knowledge
+        Q[STATE,ACTION] = Q[STATE,ACTION] + LR*(r + GAMMA*np.max(Q[new_STATE,:]) - Q[STATE,ACTION])
+        REWARDS += r
+        STATE = new_STATE
+        if DONE == True:
+            break
+    REWARD_LIST.append(REWARDS)
+    env.render()
+
+print("Reward Sum on all episodes " + str(sum(REWARD_LIST)/EPISODES))
+print("Final Values Q-Table")
+print(Q)
