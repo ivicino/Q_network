@@ -1,0 +1,174 @@
+import numpy as np
+import random
+from IPython.display import clear_output
+from collections import deque
+import progressbar
+### Progressbar is needed because I am using tensorflow.... Keras already has a progress bar as standard...
+
+
+import gym
+
+from tensorflow.keras import Model, Sequential
+from tensorflow.keras.layers import Dense, Embedding, Reshape
+from tensorflow.keras.optimizers import Adam
+
+env = gym.make("Taxi-v3").env
+env.render()
+
+print('Number of states: {}'.format(env.observation_space.n))
+print('Number of actions: {}'.format(env.action_space.n))
+
+class Agent:
+    def __init__(self, enviroment, optimizer):
+        
+        # Initialize atributes
+        self._state_size = enviroment.observation_space.n
+        self._action_size = enviroment.action_space.n
+        self._optimizer = optimizer
+        
+        self.expirience_replay = deque(maxlen=2000)
+        ### Deque is preferred over a list in the cases where we need quicker append and pop operations from both the ends of the container
+        
+        # Initialize discount and exploration rate
+        self.gamma = 0.6
+        self.epsilon = 0.1
+        
+        # Build networks
+        self.q_network = self._build_compile_model()
+        self.target_network = self._build_compile_model()
+        self.alighn_target_model()
+
+    def store(self, state, action, reward, next_state, terminated):
+        self.expirience_replay.append((state, action, reward, next_state, terminated))
+    
+    def _build_compile_model(self):
+        model = Sequential()
+        model.add(Embedding(self._state_size, 10, input_length=1))
+        ### Need to figure out exactly what Embedding does...
+        ### We see that the first layer that is used in this model is 
+        # Embedding layer. This layer is most commonly used in a language 
+        # processing, so you might be curious what is it doing here. 
+        # The problem that we are facing with the Taxi-v2 environment is that it returns 
+        # discrete value (single number) for the state. This means that we need to 
+        # reduce number of potential values a little bit.
+        # 
+        # The Embedding layer, the parameter input_dimensions 
+        # refers to the number of values we have and output_dimensions 
+        # refers to the vector space we want to reduce them. To sum it up, 
+        # we want to represent 500 possible states by 10 values and Embedding layer is used for exactly this.
+
+        ### Reshape layer prepares data for feed-forward neural network with three Dense layers.
+
+        model.add(Reshape((10,)))
+        model.add(Dense(50, activation='relu'))
+        model.add(Dense(50, activation='relu'))
+        model.add(Dense(self._action_size, activation='linear'))
+        
+        model.compile(loss='mse', optimizer=self._optimizer)
+        return model
+
+    def alighn_target_model(self):
+        self.target_network.set_weights(self.q_network.get_weights())
+        ### align their weights with the alighn_target_model method, essentatially gets weights from the Q-network and copies them to the target network
+    
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            return env.action_space.sample()
+        
+        q_values = self.q_network.predict(state)
+        return np.argmax(q_values[0])
+
+    def retrain(self, batch_size):
+        minibatch = random.sample(self.expirience_replay, batch_size)
+        
+        for state, action, reward, next_state, terminated in minibatch:
+            
+            target = self.q_network.predict(state)
+            
+            if terminated:
+                target[0][action] = reward
+            else:
+                t = self.target_network.predict(next_state)
+                target[0][action] = reward + self.gamma * np.amax(t)
+            
+            self.q_network.fit(state, target, epochs=1, verbose=0)
+
+optimizer = Adam(learning_rate=0.001) # 0.01
+agent = Agent(env, optimizer)
+
+### Rewards, how they are calculated
+'''"…you receive +20 points for a successful drop-off, and lose 1 point 
+for every timestep it takes. There is also a 10 point penalty for illegal 
+pick-up and drop-off actions."'''
+
+batch_size = 32
+num_of_episodes = 100
+timesteps_per_episode = 1000
+# agent.q_network.summary()
+
+# Load pretrained weights
+# agent.q_network.load_weights("/Users/ivicino/Documents/PythonScripts/Pygame/Deep_reinforcement_learning_textbook/Q_net_Weights_learned/100.h5")
+# agent.target_network.load_weights("/Users/ivicino/Documents/PythonScripts/Pygame/Deep_reinforcement_learning_textbook/Target_net_Weights_learned/100.h5")
+
+
+#%% Running the training...
+
+for e in range(0, num_of_episodes):
+    # Reset the enviroment
+    state = env.reset()
+    state = np.reshape(state, [1, 1])
+    
+    
+    # Initialize variables
+    reward = 0
+    terminated = False
+    ALL_REWARDS = []
+    
+    bar = progressbar.ProgressBar(maxval=timesteps_per_episode/10, widgets=\
+[progressbar.Bar('=', '[', ']'), ' ', progressbar.Percentage()])
+    bar.start()
+    
+    for timestep in range(timesteps_per_episode):
+        # Run Action
+        action = agent.act(state)
+        
+        # Take action    
+        next_state, reward, terminated, info = env.step(action) 
+        next_state = np.reshape(next_state, [1, 1])
+        agent.store(state, action, reward, next_state, terminated)
+        
+        state = next_state
+        
+        # Put rewards in a list
+        ALL_REWARDS.append(reward)
+
+        
+        # To see the the agent learning render environemt here (uncomment below):
+        env.render()
+        
+        if terminated:
+            agent.alighn_target_model()
+            break
+            
+        if len(agent.expirience_replay) > batch_size:
+            agent.retrain(batch_size)
+        
+        if timestep%10 == 0:
+            bar.update(timestep/10 + 1)
+    
+    bar.finish()
+    if (e + 1) % 1 == 0:
+        print("**********************************")
+        print("Episode: {}".format(e + 1))
+        env.render()
+        # Save the learned weights:
+        agent.q_network.save_weights('/Users/ivicino/Documents/PythonScripts/Pygame/Deep_reinforcement_learning_textbook/Q_net_Weights_learned/.h5')
+        agent.target_network.save_weights('/Users/ivicino/Documents/PythonScripts/Pygame/Deep_reinforcement_learning_textbook/Target_net_Weights_learned/.h5')
+        
+        # Try to see if I can save the weights and load them again... will need to do it for both the Qnet and Targetnet
+        print('Sum of rewards:')
+        print(sum(ALL_REWARDS))
+        print("**********************************")
+
+
+
