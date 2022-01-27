@@ -168,7 +168,7 @@ for e in range(0, num_of_episodes):
         # Try to see if I can save the weights and load them again... will need to do it for both the Qnet and Targetnet
         print('Sum of rewards:')
         print(sum(ALL_REWARDS))
-        print("**********************************")
+        print("**********************************") 
 
 
 
