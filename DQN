@@ -1,174 +1,242 @@
-import numpy as np
-import random
-from IPython.display import clear_output
+"""
+This is my attempt at using a reinforcement learning algorith (DQN) to train an agent to play the OpenAI's Taxi-v3 game. 
+I created this code by modifying the code previously created to solve OpenAI's FrozenLake-v0 game. 
+I modified the code a lot actually, you can compare it to the website linked below.
+
+This code has been confirmed to work. I trained it for 1500 episodes, takes about 3 hours to train 500 episodes. 
+I proved to myself it worked by appending the positive rewards to a list and printing them after the training has completed 
+(EpiX), which positive rewards only happen after the agent successfully picks up and drops off a passenger winning the game.  
+The agent isn't perfect after 1500 episodes though, so if you want to take this code and improve it, by all means do so! 
+Experiment and improve this code as you wish :).
+"""
+
+# Original code from: https://medium.com/analytics-vidhya/introduction-to-reinforcement-learning-rl-in-pytorch-c0862989cc0e
 from collections import deque
-import progressbar
-### Progressbar is needed because I am using tensorflow.... Keras already has a progress bar as standard...
-
-
+import random
+import math
 import gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from tensorflow.keras import Model, Sequential
-from tensorflow.keras.layers import Dense, Embedding, Reshape
-from tensorflow.keras.optimizers import Adam
+# if gpu is to be used
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-env = gym.make("Taxi-v3").env
-env.render()
+#%% CONSTANTS:
 
-print('Number of states: {}'.format(env.observation_space.n))
-print('Number of actions: {}'.format(env.action_space.n))
+n_episodes=500
+# n_episodes cannot be less than 10 otherwise the replay will not work...
+# The episodes stop after 200 actions...
 
-class Agent:
-    def __init__(self, enviroment, optimizer):
+EPISODE_PRINT = n_episodes*0.99 
+
+n_win_ticks=195 
+max_env_steps=None 
+
+gamma=0.85 #1.0 The gamma was too high, I think... Making the agent care about future rewards too much... I have never seen a gamma of 1 before... usually 0.9 or 0.99
+
+epsilon=1.0 
+epsilon_min= .1 # 0.01 # changes the potential for random actions (exploration/exploitation)
+epsilon_log_decay=0.9995 # 0.9995 # 0.995 determines the rate of choosing exploitation vs exploration. The closer to 1 it is, the less it will exploit
+
+alpha= 0.1 # 0.01 
+
+# alpha_decay=0.01 
+batch_size=256 # 64 Doubling the batch size seemed to help 
+monitor=False 
+quiet=False
+
+
+
+#%% The DQN code is shown below
+
+class DQN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(1, 100)
+        self.fc2 = nn.Linear(100, 120)    
+        self.fc3 = nn.Linear(120, 60)
+        self.fc4 = nn.Linear(60, 6)     # FrozenLake has 4 actions, Taxi has 6 actions
+
+    def forward(self, x):   
+            x = self.fc1(x)
+            x = F.relu(x)
+            x = self.fc2(x)
+            x = F.relu(x)
+            x = self.fc3(x)
+            x = F.relu(x)
+            x = self.fc4(x)
+            return x
+
+class Solver:
+    def __init__(self):
+        self.memory = deque(maxlen=100000)
+        self.env = gym.make('Taxi-v3')
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_log_decay
+        self.alpha = alpha
+        # self.alpha_decay = alpha_decay
+        self.n_episodes = n_episodes
+        self.n_win_ticks = n_win_ticks
+        self.batch_size = batch_size
+        self.quiet = quiet
+        if max_env_steps is not None: self.env._max_episode_steps = max_env_steps
+
+        # Init model
+        self.dqn = DQN()
+
+        # loading pretrained weights...
+        self.dqn.load_state_dict(torch.load('/content/drive/MyDrive/Q_net_weights/LearnedWeights_Drive_v3.pth')) # Loading from 500 episodes of training
+
+        self.criterion = torch.nn.MSELoss()
+        self.opt = torch.optim.Adam(self.dqn.parameters(), lr=self.alpha)
         
-        # Initialize atributes
-        self._state_size = enviroment.observation_space.n
-        self._action_size = enviroment.action_space.n
-        self._optimizer = optimizer
-        
-        self.expirience_replay = deque(maxlen=2000)
-        ### Deque is preferred over a list in the cases where we need quicker append and pop operations from both the ends of the container
-        
-        # Initialize discount and exploration rate
-        self.gamma = 0.6
-        self.epsilon = 0.1
-        
-        # Build networks
-        self.q_network = self._build_compile_model()
-        self.target_network = self._build_compile_model()
-        self.alighn_target_model()
 
-    def store(self, state, action, reward, next_state, terminated):
-        self.expirience_replay.append((state, action, reward, next_state, terminated))
-    
-    def _build_compile_model(self):
-        model = Sequential()
-        model.add(Embedding(self._state_size, 10, input_length=1))
-        ### Need to figure out exactly what Embedding does...
-        ### We see that the first layer that is used in this model is 
-        # Embedding layer. This layer is most commonly used in a language 
-        # processing, so you might be curious what is it doing here. 
-        # The problem that we are facing with the Taxi-v2 environment is that it returns 
-        # discrete value (single number) for the state. This means that we need to 
-        # reduce number of potential values a little bit.
-        # 
-        # The Embedding layer, the parameter input_dimensions 
-        # refers to the number of values we have and output_dimensions 
-        # refers to the vector space we want to reduce them. To sum it up, 
-        # we want to represent 500 possible states by 10 values and Embedding layer is used for exactly this.
+    def get_epsilon(self, t):
+            return max(self.epsilon_min, min(self.epsilon, 1.0 - math.log10((t + 1) * self.epsilon_decay)))
 
-        ### Reshape layer prepares data for feed-forward neural network with three Dense layers.
-
-        model.add(Reshape((10,)))
-        model.add(Dense(50, activation='relu'))
-        model.add(Dense(50, activation='relu'))
-        model.add(Dense(self._action_size, activation='linear'))
+    def preprocess_state(self, state):
+            state = nn.functional.one_hot(torch.tensor(state), self.env.observation_space.n )
+            if state.dtype == torch.int64:
+                return torch.tensor(np.reshape(state, [1, self.env.observation_space.n]), dtype=torch.float32) 
         
-        model.compile(loss='mse', optimizer=self._optimizer)
-        return model
+    def choose_action(self, state, epsilon):
+        if (np.random.random() <= epsilon):
+            AcT = self.env.action_space.sample()
+            print(f'==Random Action: {AcT}')
+            return AcT
+        else:
+            with torch.no_grad():
+                # Need to change state back into number...
+                state = torch.argmax(state, dim=1)  # changes state back to a number, still torch.tensor, a LongTensor
+                state = state.type(torch.FloatTensor)
+                AcTion = torch.argmax(self.dqn(state)).numpy()
+                if type(AcTion) != int:    #if t_state is not an integer, convert numpy array to integer
+                    AcTion = AcTion.item()    # converted the numpy array to an integer
+                print(f'--Chosen Action: {AcTion}')
+                return AcTion
+              
 
-    def alighn_target_model(self):
-        self.target_network.set_weights(self.q_network.get_weights())
-        ### align their weights with the alighn_target_model method, essentatially gets weights from the Q-network and copies them to the target network
-    
-    def act(self, state):
-        if np.random.rand() <= self.epsilon:
-            return env.action_space.sample()
-        
-        q_values = self.q_network.predict(state)
-        return np.argmax(q_values[0])
+    def remember(self, state, action, reward, next_state, done):
+            reward = torch.tensor(reward)
+            self.memory.append((state, action, reward, next_state, done))
 
-    def retrain(self, batch_size):
-        minibatch = random.sample(self.expirience_replay, batch_size)
-        
-        for state, action, reward, next_state, terminated in minibatch:
+    def replay(self, batch_size):
+        y_batch, y_target_batch = [], []
+        minibatch = random.sample(self.memory, min(len(self.memory), batch_size))
+        for state, action, reward, next_state, done in minibatch:
+            # the state is a FloatTensor in the minibatch...
+            state = torch.argmax(state, dim=1) # changes state back to a number, still torch.tensor 
+            state = state.type(torch.FloatTensor) # changes state type from LongTensor to FloatTensor
+            y = self.dqn(state)
+            if self.n_episodes== 0:
+                y_target = y.clone().detach()
+            if self.n_episodes%10 == 0:
+                y_target = y.clone().detach()
+
+            with torch.no_grad():
+                next_state = torch.argmax(next_state, dim=1) # changes state back to a number, still torch.tensor 
+                next_state = next_state.type(torch.FloatTensor) # changes state type from IntegerTensor to FloatTensor
+                if done:
+                    y_target[action] = reward  
+                else: 
+                    y_target[action] = reward + self.gamma * torch.max(self.dqn(next_state))  
             
-            target = self.q_network.predict(state)
-            
-            if terminated:
-                target[0][action] = reward
-            else:
-                t = self.target_network.predict(next_state)
-                target[0][action] = reward + self.gamma * np.amax(t)
-            
-            self.q_network.fit(state, target, epochs=1, verbose=0)
+            y_batch.append(y)
+            y_target_batch.append(y_target)
 
-optimizer = Adam(learning_rate=0.01) # 0.01
-agent = Agent(env, optimizer)
-
-### Rewards, how they are calculated
-'''"…you receive +20 points for a successful drop-off, and lose 1 point 
-for every timestep it takes. There is also a 10 point penalty for illegal 
-pick-up and drop-off actions."'''
-
-batch_size = 32
-num_of_episodes = 100
-timesteps_per_episode = 1000
-# agent.q_network.summary()
-
-# Load pretrained weights
-# agent.q_network.load_weights("/Users/ivicino/Documents/PythonScripts/Pygame/Deep_reinforcement_learning_textbook/Q_net_Weights_learned/100.h5")
-# agent.target_network.load_weights("/Users/ivicino/Documents/PythonScripts/Pygame/Deep_reinforcement_learning_textbook/Target_net_Weights_learned/100.h5")
-
-
-#%% Running the training...
-
-for e in range(0, num_of_episodes):
-    # Reset the enviroment
-    state = env.reset()
-    state = np.reshape(state, [1, 1])
-    
-    
-    # Initialize variables
-    reward = 0
-    terminated = False
-    ALL_REWARDS = []
-    
-    bar = progressbar.ProgressBar(maxval=timesteps_per_episode/10, widgets=\
-[progressbar.Bar('=', '[', ']'), ' ', progressbar.Percentage()])
-    bar.start()
-    
-    for timestep in range(timesteps_per_episode):
-        # Run Action
-        action = agent.act(state)
+        y_batch = torch.cat(y_batch)
+        y_target_batch = torch.cat(y_target_batch)
         
-        # Take action    
-        next_state, reward, terminated, info = env.step(action) 
-        next_state = np.reshape(next_state, [1, 1])
-        agent.store(state, action, reward, next_state, terminated)
-        
-        state = next_state
-        
-        # Put rewards in a list
-        ALL_REWARDS.append(reward)
+        self.opt.zero_grad()
+        loss = self.criterion(y_batch, y_target_batch)
+        loss.backward()
+        self.opt.step()        
 
-        
-        # To see the the agent learning render environemt here (uncomment below):
-        env.render()
-        
-        if terminated:
-            agent.alighn_target_model()
-            break
-            
-        if len(agent.expirience_replay) > batch_size:
-            agent.retrain(batch_size)
-        
-        if timestep%10 == 0:
-            bar.update(timestep/10 + 1)
-    
-    bar.finish()
-    if (e + 1) % 1 == 0:
-        print("**********************************")
-        print("Episode: {}".format(e + 1))
-        env.render()
-        # Save the learned weights:
-        agent.q_network.save_weights('/Users/ivicino/Documents/PythonScripts/Pygame/Deep_reinforcement_learning_textbook/Q_net_Weights_learned/.h5')
-        agent.target_network.save_weights('/Users/ivicino/Documents/PythonScripts/Pygame/Deep_reinforcement_learning_textbook/Target_net_Weights_learned/.h5')
-        
-        # Try to see if I can save the weights and load them again... will need to do it for both the Qnet and Targetnet
-        print('Sum of rewards:')
-        print(sum(ALL_REWARDS))
-        print("**********************************") 
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+    def run(self):
+            REWARDS = []
+            EpiX = []
+            Move_List = []
+
+            for e in range(self.n_episodes):
+                        state = self.preprocess_state(self.env.reset())
+                        done = False
+                        i = 0
+                        while not done:
+
+                            action = self.choose_action(state, self.get_epsilon(e))
+                            print(f'ACTION: {action}') 
+                            # action - 0: South, 1: North, 2: East, 3: West, 4: Pickup, 5: Dropoff
+                      
+                            next_state, reward, done, _ = self.env.step(action)
 
 
+                            Move_List.append(action) 
+                            if len(Move_List) == 2:
+                                if Move_List[0] == Move_List[1]:
+                                    reward = -1 
+                                Move_List = []
+                                # Goal of this code is to give reward to incentivise agent to use different moves
+                                # I think it is working!!! It definitely makes the agent choose different actions!!!
 
+                            # Put rewards in Reward list    
+                            REWARDS.append(reward)
+                            
+                            next_state = self.preprocess_state(next_state)
+
+                            self.remember(state, action, reward, next_state, done)
+                            state = next_state
+
+                            self.replay(self.batch_size)
+
+                            i += 1  
+
+                            if reward >= 1:   # I believe a complete victory is +20 reward...
+                                EpiX.append(e)
+                                print(EpiX)
+
+                            # render each frame...
+                            # self.env.render()
+
+                            # to render only the last frames...
+                            if e >= EPISODE_PRINT and not self.quiet:   
+                                self.env.render()
+                            else:
+                                print(f'Calculating... Episode {e}')
+                            
+                            # print sum Rewards as episodes progress...
+                            SUM_REWARDS = sum(REWARDS) 
+                            print(f'Episode Rewards (list): {SUM_REWARDS}') 
+                            if len(REWARDS) == 200: # clears REWARDS list after every episode, which has 200 actions in them...
+                              REWARDS = []
+
+                            
+                            if e%100 ==0: # Save every 100 episodes
+                              torch.save(self.dqn.state_dict(), '/content/drive/MyDrive/Q_net_weights/Taxi_LearnedWeights_Drive_v4.pth')
+
+
+            SUM_REWARDS = sum(EpiX) # EpiX is a list with all positive rewards... 
+            print(f'\n Reward (list) {SUM_REWARDS} \n') 
+
+            if SUM_REWARDS > 0:
+                if not self.quiet: 
+                    print('Ran {} episodes. May have solved after {}th episode ✔ --- YAY!!!! \n'.format(e, EpiX[0]))    
+                    
+
+            if SUM_REWARDS <= 0:  
+                print('\n Did not solve after {} episodes      😞 \n'.format(e))    
+
+            # It was solved before episode 371 - evidenced by the episode being updated before the rewards!!!     
+            # I am training for more episodes to improve the game playing... total of 1500 episodes...(LearnedWeights_Drive_v3.pth)
+            # Training it for another 500 episodes... total of 2000 episodes... (Taxi_LearnedWeights_Drive_v4.pth)
+
+if __name__ == '__main__':  
+    agent = Solver()
+    agent.run()  
+    agent.env.close() 
